@@ -101,7 +101,7 @@ const handleAnswer = async (req, res) => {
     : `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial timeout="45" dialMusic="real" callerId="+917965850027"
-          action="https://inch-owners-yard-hammer.trycloudflare.com/dial-status" method="POST" redirect="false">
+          action="https://vobiz-backend-production.up.railway.app/dial-status" method="POST" redirect="false">
         <User>sip:sairam8391265128911238046@registrar.vobiz.ai</User>
     </Dial>
     <Speak>The customer is not available. Please try again later.</Speak>
