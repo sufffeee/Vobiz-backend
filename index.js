@@ -10,6 +10,9 @@ app.use(express.json());
 // In-memory token store (use Redis or DB in production)
 const deviceTokens = new Map();
 
+// Diagnostic: store recent dial-status callbacks for inspection
+const recentDialStatus = [];
+
 // Room of the most recent parked caller — the app's join leg (its outbound
 // call to our DID, From = DID) is bridged into this same room.
 let lastConferenceRoom = null;
@@ -117,7 +120,14 @@ app.all('/answer', handleAnswer);
 app.all('/dial-status', (req, res) => {
   const b = { ...req.query, ...req.body };
   console.log(`[DIAL-STATUS] ${JSON.stringify(b)}`);
+  recentDialStatus.push({ ts: new Date().toISOString(), data: b });
+  if (recentDialStatus.length > 20) recentDialStatus.shift();
   res.status(200).send('OK');
+});
+
+// Retrieve recent dial-status events
+app.get('/dial-log', (req, res) => {
+  res.json(recentDialStatus);
 });
 
 // Probe route: returns Speak+Hangup so a successful route is visible in CDR
