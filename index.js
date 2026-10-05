@@ -104,6 +104,7 @@ const handleAnswer = async (req, res) => {
     : `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial timeout="45" dialMusic="real" callerId="+917965850027"
+          callbackUrl="https://vobiz-backend-production.up.railway.app/dial-callback" callbackMethod="POST"
           action="https://vobiz-backend-production.up.railway.app/dial-status" method="POST" redirect="false">
         <User>sip:sairam8391265128911238046@registrar.vobiz.ai</User>
     </Dial>
@@ -120,8 +121,19 @@ app.all('/answer', handleAnswer);
 app.all('/dial-status', (req, res) => {
   const b = { ...req.query, ...req.body };
   console.log(`[DIAL-STATUS] ${JSON.stringify(b)}`);
-  recentDialStatus.push({ ts: new Date().toISOString(), data: b });
-  if (recentDialStatus.length > 20) recentDialStatus.shift();
+  recentDialStatus.push({ ts: new Date().toISOString(), src: 'action', data: b });
+  if (recentDialStatus.length > 50) recentDialStatus.shift();
+  res.status(200).send('OK');
+});
+
+// Real-time B-leg lifecycle events (callbackUrl of the <Dial> element):
+// DialAnswer / DialConnected / hangup. Answers when the B-leg answered, which
+// is what decides whether the platform will ever send a BYE for it.
+app.all('/dial-callback', (req, res) => {
+  const b = { ...req.query, ...req.body };
+  console.log(`[DIAL-CALLBACK] ${JSON.stringify(b)}`);
+  recentDialStatus.push({ ts: new Date().toISOString(), src: 'callback', data: b });
+  if (recentDialStatus.length > 50) recentDialStatus.shift();
   res.status(200).send('OK');
 });
 
