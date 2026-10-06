@@ -1,24 +1,103 @@
 const express = require('express');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getMessaging } = require('firebase-admin/messaging');
+const Redis = require('ioredis');
 require('dotenv').config();
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// In-memory token store (use Redis or DB in production)
+// ---------------------------------------------------------------------------
+// Persistent store.
+//
+// Memory is always the read path (single instance, zero latency). Redis, when
+// REDIS_URL is configured, is the durability layer: every write is mirrored
+// there and state is rehydrated from it on boot, so a redeploy no longer wipes
+// FCM tokens, the dial log or the parked conference room. If Redis is absent
+// or errors, the app keeps running on memory alone - a cache outage must never
+// take down live calls.
+// ---------------------------------------------------------------------------
+const REDIS_URL = process.env.REDIS_URL || null;
+const KEY_TOKENS = 'vobiz:fcm:tokens';   // hash: deviceId -> FCM token
+const KEY_DIALLOG = 'vobiz:dial:log';    // list: newest 50 dial/callback events
+const KEY_CONFERENCE = 'vobiz:conference:last'; // string: parked room name
+const DIAL_LOG_MAX = 50;
+
+let redis = null;
+let redisState = REDIS_URL ? 'connecting' : 'disabled';
+
+if (REDIS_URL) {
+  redis = new Redis(REDIS_URL, {
+    connectTimeout: 4000,
+    maxRetriesPerRequest: 1,
+    retryStrategy: (times) => Math.min(times * 1000, 10000),
+    lazyConnect: false,
+  });
+  redis.on('ready', () => {
+    redisState = 'connected';
+    console.log('[STARTUP] Redis connected');
+  });
+  redis.on('error', (e) => {
+    if (redisState !== 'error') console.warn('[REDIS] error:', e.message);
+    redisState = 'error';
+  });
+  redis.on('close', () => {
+    if (redisState === 'connected') redisState = 'reconnecting';
+  });
+} else {
+  console.log('[STARTUP] REDIS_URL not set - state is in-memory only (lost on restart)');
+}
+
+// Fire-and-forget write to Redis; failures are logged, never thrown.
+const persist = (fn) => {
+  if (!redis) return;
+  Promise.resolve()
+    .then(() => fn(redis))
+    .catch((e) => console.warn('[REDIS] persist failed:', e.message));
+};
+
+// In-memory mirrors (read path).
 const deviceTokens = new Map();
+const recentDialStatus = [];
+let lastConferenceRoom = null;
+
+// Rehydrate memory from Redis after a restart.
+const hydrate = async () => {
+  if (!redis) return;
+  try {
+    const tokens = await redis.hgetall(KEY_TOKENS);
+    for (const [deviceId, token] of Object.entries(tokens || {})) {
+      deviceTokens.set(deviceId, token);
+    }
+    const raw = await redis.lrange(KEY_DIALLOG, 0, -1);
+    for (const line of raw) {
+      try { recentDialStatus.push(JSON.parse(line)); } catch (_) { /* skip bad entry */ }
+    }
+    lastConferenceRoom = await redis.get(KEY_CONFERENCE);
+    console.log(
+      `[STARTUP] Redis hydrated: tokens=${deviceTokens.size} ` +
+      `dialLog=${recentDialStatus.length} conference=${lastConferenceRoom || 'none'}`
+    );
+  } catch (e) {
+    console.warn('[STARTUP] Redis hydrate failed (continuing with memory):', e.message);
+  }
+};
+hydrate();
 
 // Process start time - surfaced on /health to confirm a redeploy/restart.
 const STARTED_AT = new Date().toISOString();
 
-// Diagnostic: store recent dial-status callbacks for inspection
-const recentDialStatus = [];
-
-// Room of the most recent parked caller — the app's join leg (its outbound
-// call to our DID, From = DID) is bridged into this same room.
-let lastConferenceRoom = null;
+// Append a dial/callback event: memory keeps the newest DIAL_LOG_MAX, Redis
+// mirrors it (RPUSH + LTRIM so the list never grows past the cap).
+const recordDialEvent = (entry) => {
+  recentDialStatus.push(entry);
+  if (recentDialStatus.length > DIAL_LOG_MAX) recentDialStatus.shift();
+  persist(async (r) => {
+    await r.rpush(KEY_DIALLOG, JSON.stringify(entry));
+    await r.ltrim(KEY_DIALLOG, -DIAL_LOG_MAX, -1);
+  });
+};
 
 // Initialize Firebase Admin SDK if credentials are provided
 let firebaseInitialized = false;
@@ -64,7 +143,10 @@ const handleAnswer = async (req, res) => {
 
   // Generate a unique conference name
   const conferenceName = `vobiz-dialer-${CallUUID}-${Date.now()}`;
-  if (ANSWER_MODE === 'conference') lastConferenceRoom = conferenceName;
+  if (ANSWER_MODE === 'conference') {
+    lastConferenceRoom = conferenceName;
+    persist((r) => r.set(KEY_CONFERENCE, conferenceName));
+  }
 
   // Send FCM to all registered devices (only in conference mode; in dial mode
   // the SIP INVITE itself rings the app, so an FCM wake would duplicate UI)
@@ -126,8 +208,7 @@ app.all('/answer', handleAnswer);
 app.all('/dial-status', (req, res) => {
   const b = { ...req.query, ...req.body };
   console.log(`[DIAL-STATUS] ${JSON.stringify(b)}`);
-  recentDialStatus.push({ ts: new Date().toISOString(), src: 'action', data: b });
-  if (recentDialStatus.length > 50) recentDialStatus.shift();
+  recordDialEvent({ ts: new Date().toISOString(), src: 'action', data: b });
   res.status(200).send('OK');
 });
 
@@ -137,8 +218,7 @@ app.all('/dial-status', (req, res) => {
 app.all('/dial-callback', (req, res) => {
   const b = { ...req.query, ...req.body };
   console.log(`[DIAL-CALLBACK] ${JSON.stringify(b)}`);
-  recentDialStatus.push({ ts: new Date().toISOString(), src: 'callback', data: b });
-  if (recentDialStatus.length > 50) recentDialStatus.shift();
+  recordDialEvent({ ts: new Date().toISOString(), src: 'callback', data: b });
   res.status(200).send('OK');
 });
 
@@ -160,6 +240,7 @@ app.post('/register-token', (req, res) => {
     return res.status(400).json({ error: 'Missing token or deviceId' });
   }
   deviceTokens.set(deviceId, token);
+  persist((r) => r.hset(KEY_TOKENS, deviceId, token));
   console.log(`[REGISTER] Device ${deviceId} registered`);
   res.json({ success: true });
 });
@@ -176,6 +257,7 @@ app.post('/hangup', (req, res) => {
 //   project   -> which Firebase project the key belongs to; must equal the
 //                app's google-services.json project_id (currently vobiz-fire)
 //   mode      -> ANSWER_MODE actually in effect
+//   redis     -> disabled | connecting | connected | error
 //   startedAt -> proves the service restarted after a variable change
 app.get('/health', (req, res) => {
   res.json({
@@ -184,6 +266,7 @@ app.get('/health', (req, res) => {
     firebase: firebaseInitialized,
     project: firebaseProject,
     mode: ANSWER_MODE,
+    redis: redisState,
     startedAt: STARTED_AT,
   });
 });
