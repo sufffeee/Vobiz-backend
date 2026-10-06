@@ -10,6 +10,9 @@ app.use(express.json());
 // In-memory token store (use Redis or DB in production)
 const deviceTokens = new Map();
 
+// Process start time - surfaced on /health to confirm a redeploy/restart.
+const STARTED_AT = new Date().toISOString();
+
 // Diagnostic: store recent dial-status callbacks for inspection
 const recentDialStatus = [];
 
@@ -19,11 +22,13 @@ let lastConferenceRoom = null;
 
 // Initialize Firebase Admin SDK if credentials are provided
 let firebaseInitialized = false;
+let firebaseProject = null;
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   initializeApp({ credential: cert(serviceAccount) });
   firebaseInitialized = true;
-  console.log('[STARTUP] Firebase Admin SDK initialized successfully');
+  firebaseProject = serviceAccount.project_id || null;
+  console.log(`[STARTUP] Firebase Admin SDK initialized successfully (project=${firebaseProject})`);
 } catch (e) {
   console.warn('[STARTUP] Firebase Admin SDK initialization failed (FCM will be disabled):', e.message);
   console.warn('[STARTUP] FCM notifications will be disabled. Provide valid FIREBASE_SERVICE_ACCOUNT to enable.');
@@ -166,9 +171,21 @@ app.post('/hangup', (req, res) => {
   res.status(200).send('OK');
 });
 
-// --- Health Check ---
+// --- Health Check / config verification ---
+//   firebase  -> service account parsed + accepted by firebase-admin
+//   project   -> which Firebase project the key belongs to; must equal the
+//                app's google-services.json project_id (currently vobiz-fire)
+//   mode      -> ANSWER_MODE actually in effect
+//   startedAt -> proves the service restarted after a variable change
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', devices: deviceTokens.size, firebase: firebaseInitialized });
+  res.json({
+    status: 'ok',
+    devices: deviceTokens.size,
+    firebase: firebaseInitialized,
+    project: firebaseProject,
+    mode: ANSWER_MODE,
+    startedAt: STARTED_AT,
+  });
 });
 
 const PORT = process.env.PORT || 3000;
